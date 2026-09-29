@@ -49,4 +49,5 @@ type PurgeResult struct {
 	DeletedRecords  int64 `json:"deleted_records"`
 	ReclaimedBytes  int64 `json:"reclaimed_bytes"`
 	SkippedFrozen   int   `json:"skipped_frozen"`
+	SkippedReplay   int   `json:"skipped_replay"`
 }

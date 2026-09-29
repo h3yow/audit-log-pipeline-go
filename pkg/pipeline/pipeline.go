@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/h3yow/audit-log-pipeline-go/pkg/checkpoint"
+	"github.com/h3yow/audit-log-pipeline-go/pkg/replay"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/router"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/sink"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/storage"
@@ -30,7 +31,12 @@ type Config struct {
 	MaxInFlight int
 	// MaxPendingDisk 磁盘待确认总量软上限；超过后 Ingest 返回 ErrBackpressure。
 	MaxPendingDisk int64
-	Logger         *slog.Logger
+	// ReplaySinkName 历史回放独立目标下游的路由名。
+	// 必须存在于 Sinks 中；为空时回放能力不启用。
+	ReplaySinkName string
+	// ReplayFailureRetry 回放下游故障首次退避（默认 50ms，内部指数封顶 2s）。
+	ReplayFailureRetry time.Duration
+	Logger             *slog.Logger
 }
 
 type srcWorker struct {
@@ -56,6 +62,8 @@ type Pipeline struct {
 
 	metricsMu sync.Mutex
 	metrics   Metrics
+
+	replays *replay.Manager
 
 	stopPurge chan struct{}
 	closed    bool
@@ -117,6 +125,31 @@ func New(cfg Config) (*Pipeline, error) {
 		_ = cpm.Close()
 		return nil, err
 	}
+
+	// 历史回放在配置了独立目标下游时启用：独立的进度目录与状态链，
+	// 与实时投递检查点完全隔离。
+	if cfg.ReplaySinkName != "" {
+		if _, ok := cfg.Sinks[cfg.ReplaySinkName]; !ok {
+			_ = st.Close()
+			_ = cpm.Close()
+			return nil, fmt.Errorf("pipeline: replay sink route %q not configured", cfg.ReplaySinkName)
+		}
+		rm, err := replay.New(replay.Config{
+			Dir:          filepath.Join(cfg.Dir, "replays"),
+			KeyFile:      keyFile,
+			Store:        st,
+			Sink:         replay.NewSinkAdapter(cfg.Sinks),
+			FailureRetry: cfg.ReplayFailureRetry,
+			Logger:       cfg.Logger,
+		})
+		if err != nil {
+			_ = st.Close()
+			_ = cpm.Close()
+			return nil, fmt.Errorf("pipeline: open replay manager: %w", err)
+		}
+		p.replays = rm
+	}
+
 	p.wg.Add(1)
 	go p.purgeLoop()
 	return p, nil
@@ -139,6 +172,9 @@ func (p *Pipeline) Close() error {
 	p.mu.Unlock()
 	for _, w := range workers {
 		<-w.done
+	}
+	if p.replays != nil {
+		_ = p.replays.Close()
 	}
 	p.wg.Wait()
 	err1 := p.cp.Close()

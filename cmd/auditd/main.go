@@ -35,14 +35,16 @@ func main() {
 		{Name: "billing-route", Sources: []string{"billing"}, Action: router.ActionAccept, Route: "audit"},
 	}, "audit")
 	ms := sink.NewMemorySink()
+	replaySink := sink.NewMemorySink() // 历史回放的独立目标下游
 	p, err := pipeline.New(pipeline.Config{
-		Dir:           *dir,
-		Router:        r,
-		Sinks:         map[string]sink.Sink{"audit": ms},
-		Retention:     storage.Retention{MaxAge: 24 * time.Hour},
-		PurgeInterval: 10 * time.Second,
-		MaxInFlight:   128,
-		Logger:        logger,
+		Dir:            *dir,
+		Router:         r,
+		Sinks:          map[string]sink.Sink{"audit": ms, "replay": replaySink},
+		Retention:      storage.Retention{MaxAge: 24 * time.Hour},
+		PurgeInterval:  10 * time.Second,
+		MaxInFlight:    128,
+		ReplaySinkName: "replay",
+		Logger:         logger,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "start failed: %v\n", err)
@@ -107,7 +109,41 @@ func main() {
 	})
 	res, _ := p.PurgeNow(time.Now())
 	logger.Info("purge with active freeze",
-		"deleted", res.DeletedSegments, "skipped_frozen", res.SkippedFrozen)
+		"deleted", res.DeletedSegments, "skipped_frozen", res.SkippedFrozen,
+		"skipped_replay", res.SkippedReplay)
+
+	// 4. 历史回放：把 web 来源序号 [1,3] 的留存事件按原始顺序
+	//    重新投递到独立下游 "replay"，与实时投递互不影响。
+	logger.Info("=== starting historical replay web[1,3] -> replay sink ===")
+	rst, err := p.StartReplay(pipeline.ReplayRequest{
+		ID: "demo-replay-1", Source: "web", FromSeq: 1, ToSeq: 3,
+	})
+	if err != nil {
+		logger.Error("replay start failed", "err", err)
+	} else {
+		logger.Info("replay accepted",
+			"job", rst.ID, "resolved_from", rst.FromSeq, "resolved_to", rst.ToSeq,
+			"phase", rst.Phase)
+	}
+	// 等待回放跑完并打印进度（已放到哪、还剩多少、重试次数）。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := p.ReplayStatus("demo-replay-1")
+		if err == nil && (st.Phase == "completed" || st.Phase == "failed" || st.Phase == "canceled") {
+			logger.Info("replay finished",
+				"phase", st.Phase, "cursor", st.Cursor, "to_seq", st.ToSeq,
+				"remaining", pipeline.ReplayRemaining(st),
+				"delivered", st.Delivered, "retries", st.Retries,
+				"skipped_before_time", st.Skipped.BeforeTime,
+				"skipped_after_time", st.Skipped.AfterTime,
+				"skipped_rejected", st.Skipped.Rejected,
+				"err", st.LastError)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	logger.Info("replay sink visible events",
+		"web", replaySink.Visible("replay", "web"))
 
 	// 优雅关闭
 	sig := make(chan os.Signal, 1)

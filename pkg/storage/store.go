@@ -41,6 +41,7 @@ type Store struct {
 	mu      sync.RWMutex
 	srcs    map[string]*srcState
 	freezes []Freeze
+	holds   map[string]*replayHold // 回放保留锁（jobID -> hold）
 	closed  bool
 }
 

@@ -44,6 +44,11 @@ func (s *Store) Purge(nowUnix int64) (PurgeResult, error) {
 				res.SkippedFrozen++
 				continue
 			}
+			if overlapsHold(s.holds, source, e.MinSeq, e.MaxSeq) {
+				// 正在回放的范围：回放完成前不得清理。
+				res.SkippedReplay++
+				continue
+			}
 			size := e.Size
 			path := filepath.Join(st.dir, e.Name)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
