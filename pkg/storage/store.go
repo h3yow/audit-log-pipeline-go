@@ -38,10 +38,11 @@ type Store struct {
 	retention Retention
 	maxSeg    int64
 
-	mu      sync.RWMutex
-	srcs    map[string]*srcState
-	freezes []Freeze
-	closed  bool
+	mu          sync.RWMutex
+	srcs        map[string]*srcState
+	freezes     []Freeze
+	replayHolds map[string]replayHold // jobID -> 活跃回放保留占位
+	closed      bool
 }
 
 type srcState struct {
@@ -69,11 +70,12 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:       opts.Dir,
-		key:       key,
-		retention: opts.Retention,
-		maxSeg:    maxSeg,
-		srcs:      map[string]*srcState{},
+		dir:         opts.Dir,
+		key:         key,
+		retention:   opts.Retention,
+		maxSeg:      maxSeg,
+		srcs:        map[string]*srcState{},
+		replayHolds: map[string]replayHold{},
 	}
 	if err := s.loadFreezes(); err != nil {
 		return nil, err

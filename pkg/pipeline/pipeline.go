@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/h3yow/audit-log-pipeline-go/pkg/checkpoint"
+	"github.com/h3yow/audit-log-pipeline-go/pkg/replay"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/router"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/sink"
 	"github.com/h3yow/audit-log-pipeline-go/pkg/storage"
@@ -26,8 +27,11 @@ type Config struct {
 	Sinks         map[string]sink.Sink
 	Retention     storage.Retention
 	PurgeInterval time.Duration
-	// MaxInFlight 每来源内存待确认事件上限（故障期间内存有界）。
+	// MaxInFlight 每来源实时投递的在飞内存事件上限（故障期间内存有界）。
 	MaxInFlight int
+	// ReplaySinks 是回放专用的独立目标下游（与实时 Sinks 物理隔离，
+	// 路由名互不影响）。回放进度也独立存放于 <dir>/replay/。
+	ReplaySinks map[string]sink.Sink
 	// MaxPendingDisk 磁盘待确认总量软上限；超过后 Ingest 返回 ErrBackpressure。
 	MaxPendingDisk int64
 	Logger         *slog.Logger
@@ -46,6 +50,7 @@ type Pipeline struct {
 	log   *slog.Logger
 	store *storage.Store
 	cp    *checkpoint.Manager
+	repm  *replay.Manager
 	rsink *sink.RouterSink
 
 	mu       sync.Mutex
@@ -100,12 +105,23 @@ func New(cfg Config) (*Pipeline, error) {
 		_ = st.Close()
 		return nil, fmt.Errorf("pipeline: open checkpoints: %w", err)
 	}
+	repm, err := replay.Open(filepath.Join(cfg.Dir, "replay"), keyFile, st)
+	if err != nil {
+		_ = cpm.Close()
+		_ = st.Close()
+		return nil, fmt.Errorf("pipeline: open replay manager: %w", err)
+	}
+	for name, s := range cfg.ReplaySinks {
+		repm.RegisterSink(name, s)
+	}
+	repm.SetLogger(cfg.Logger)
 
 	p := &Pipeline{
 		cfg:       cfg,
 		log:       cfg.Logger,
 		store:     st,
 		cp:        cpm,
+		repm:      repm,
 		rsink:     sink.NewRouterSink(cfg.Sinks),
 		ingestMu:  map[string]*sync.Mutex{},
 		dedup:     map[string]map[string]int64{},
@@ -113,9 +129,22 @@ func New(cfg Config) (*Pipeline, error) {
 		stopPurge: make(chan struct{}),
 	}
 	if err := p.recover(); err != nil {
+		_ = repm.Close()
 		_ = st.Close()
 		_ = cpm.Close()
 		return nil, err
+	}
+	// 重启后续跑未完成回放：目标下游已配置的自动继续；
+	// 缺失的保持 blocked（可稍后通过 RegisterReplaySink + ResumeReplay 处理）。
+	resumed, blocked, err := repm.ResumeAll()
+	if err != nil {
+		_ = repm.Close()
+		_ = st.Close()
+		_ = cpm.Close()
+		return nil, fmt.Errorf("pipeline: resume replays: %w", err)
+	}
+	if resumed > 0 || len(blocked) > 0 {
+		cfg.Logger.Info("replay jobs recovered", "resumed", resumed, "blocked", blocked)
 	}
 	p.wg.Add(1)
 	go p.purgeLoop()
@@ -141,8 +170,12 @@ func (p *Pipeline) Close() error {
 		<-w.done
 	}
 	p.wg.Wait()
+	err0 := p.repm.Close()
 	err1 := p.cp.Close()
 	err2 := p.store.Close()
+	if err0 != nil {
+		return err0
+	}
 	if err1 != nil {
 		return err1
 	}
@@ -192,6 +225,17 @@ type Metrics struct {
 	DeliveryRetries int64         `json:"delivery_retries"`
 	PendingOnDisk   int64         `json:"pending_on_disk"`
 	Storage         storage.Stats `json:"storage"`
+	Replays         ReplayMetrics `json:"replays"`
+}
+
+// ReplayMetrics 是回放子系统的聚合可观测状态（与实时指标互相独立）。
+type ReplayMetrics struct {
+	Running   int   `json:"running"`
+	Blocked   int   `json:"blocked"`
+	Complete  int   `json:"complete"`
+	Delivered int64 `json:"delivered"`
+	Remaining int64 `json:"remaining"`
+	Retries   int64 `json:"retries"`
 }
 
 // Metrics 返回当前指标快照。
@@ -206,5 +250,20 @@ func (p *Pipeline) Metrics() Metrics {
 	p.mu.Unlock()
 	st, _ := p.store.Stats()
 	m.Storage = st
+	if progs, err := p.repm.All(); err == nil {
+		for _, pr := range progs {
+			switch pr.Status {
+			case replay.StatusRunning:
+				m.Replays.Running++
+			case replay.StatusBlocked, replay.StatusPaused:
+				m.Replays.Blocked++
+			case replay.StatusComplete:
+				m.Replays.Complete++
+			}
+			m.Replays.Delivered += pr.Delivered
+			m.Replays.Remaining += pr.Remaining()
+			m.Replays.Retries += pr.Retries
+		}
+	}
 	return m
 }

@@ -2,7 +2,8 @@
 
 一个零外部依赖（仅 Go 标准库）的本地审计管道，用本地磁盘 + 内存下游模拟多事件来源、
 多下游投递，重点保证：**结论可区分、顺序稳定、保留/冻结可执行、防篡改、
-故障与重启后不丢不重、检查点回退被明确拒绝**。
+故障与重启后不丢不重、检查点回退被明确拒绝**，并支持**按序号/时间范围把历史事件
+顺序回放到独立下游（独立持久化进度、中断续传、与保留清理/冻结和平共处）**。
 
 ## 1. 架构总览
 
@@ -21,6 +22,15 @@ event.ParseEvent ──► Ingest(每来源串行)
                                         下游幂等 Deliver(route, source, seq)
                                                      │
                                   checkpoint.Advance（单调水位 + 锚点链）
+
+  历史回放（与实时路径并行、独立）：
+  StartReplay(jobID, source, target, 序号/时间闭区间)
+        │  清单快照静态判定 Plan(matched/gaps/skipped，逐条可解释)
+        ▼
+  Store.Scan 按 seq 升序流式扫描 ──► 独立下游 ReplaySinks[target]
+        │  每条确认后写 <dir>/replay/<job>.job（独立哈希链，防回退）
+        ▼
+  Purge 回放占位 SkippedReplay；重启后 ResumeAll 从 next_seq 续跑
 ```
 
 模块划分：
@@ -30,9 +40,10 @@ event.ParseEvent ──► Ingest(每来源串行)
 | `pkg/event` | 事件结构、严格 JSON 解析/校验、处理结论 `Decision` |
 | `pkg/router` | 有序策略规则（deny / accept+route），未命中走默认路由 |
 | `pkg/storage` | 分段落盘、帧级 HMAC 哈希链、清单哈希链、保留期/冻结清理、防篡改 |
-| `pkg/checkpoint` | 每来源投递水位，单调推进 + 状态链 + 全局锚点文件 |
+| `pkg/checkpoint` | 每来源实时投递水位，单调推进 + 状态链 + 全局锚点文件 |
+| `pkg/replay` | 按范围历史回放：范围静态判定、独立持久化进度链、顺序流式投递、保留占位 |
 | `pkg/sink` | 下游接口、内存模拟下游（故障注入、幂等）、按路由分发 |
-| `pkg/pipeline` | 接入/去重/路由/落盘/投递/检查点编排，启动恢复与指标 |
+| `pkg/pipeline` | 接入/去重/路由/落盘/投递/检查点/回放编排，启动恢复与指标 |
 | `cmd/auditd` | 可本地运行的端到端演示 |
 
 ## 2. 投递语义（delivery semantics）
@@ -84,8 +95,10 @@ event.ParseEvent ──► Ingest(每来源串行)
 <dir>/store/freezes.json                # 冻结集合（带 MAC，防篡改）
 <dir>/store/src/<hex(source)>/manifest.json
 <dir>/store/src/<hex(source)>/seg-000001.dat ...
-<dir>/checkpoints/<hex(source)>.cp      # 每来源检查点状态（带链 MAC）
-<dir>/checkpoints/anchors.json          # 全局最新版本锚点（带 MAC）
+<dir>/checkpoints/<hex(source)>.cp      # 每来源实时投递检查点状态（带链 MAC）
+<dir>/checkpoints/anchors.json          # 实时检查点全局最新版本锚点（带 MAC）
+<dir>/replay/<hex(jobID)>.job           # 每个回放任务的独立进度（带链 MAC）
+<dir>/replay/anchors.json               # 回放进度全局最新版本锚点（带 MAC）
 ```
 
 ### 4.2 防篡改（双层哈希链）
@@ -130,6 +143,87 @@ event.ParseEvent ──► Ingest(每来源串行)
 | 投递成功后崩溃 | 下游幂等键保证重试不产生重复可见记录 |
 | 检查点回退/复刻/锚点篡改 | `ErrRollback`，拒绝启动并记录错误日志 |
 
+## 5A. 历史回放（replay）
+
+合规抽查或下游重建时，可以把**过去某个来源、某段序号或某段时间**内留存的
+事件，按**当初接入的顺序**重新投递到一个**独立的目标下游**。回放与实时投递
+并行运行、互不影响。
+
+### 5A.1 范围与判定（边界必须可解释）
+
+`Pipeline.StartReplay(jobID, source, target, ReplayRange{FromSeq,ToSeq,From,To})`
+
+- 区间全部是**闭区间**；序号与时间可以单独给，也可以组合（同时满足才命中）；
+  至少要给一个边界，否则返回 `replay.ErrInvalidRequest`；
+- 开始前在清单快照上做一次**静态判定（Plan）**，结果持久化进任务：
+  - `eff_from_seq/eff_to_seq`：实际扫描的序号闭区间（依据分段元数据剪枝）；
+  - `matched`：通过全部过滤、应当投递的记录总数；
+  - `gaps`：请求区间内的缺失序号段，区分为 `purged`（命中 `deleted` 清单项，
+    即被保留期清理）与 `missing`（该序号从未存在于留存），都附判定依据；
+  - `skipped`：逐条记录的跳过原因，**没有任何一条被默默跳过**：
+    `before_range/after_range`（部分命中的分段）、`outside_time`（在序号范围内
+    但不在时间区间内）、`rejected`（接入时命中拒绝策略，留存但回放也不投递）；
+- 计划是**快照语义**：扫描区间在发起时确定，回放进行中新接入、且落在范围内的
+  事件不属于本次任务（进度 `next_seq` 越过计划右端即完成），需要重放可另开任务；
+- 同一 `jobID` 是幂等任务键：重复发起返回 `replay.ErrExists`，绝不重放第二遍。
+
+### 5A.2 顺序、内存与幂等
+
+- 顺序：复用 `Store.Scan` 按 seq 升序流式扫描，**回放可见顺序 == 原始接入顺序**；
+- 内存有界：逐条扫描、逐条投递，任何时刻内存中只有当前一条，
+  不会把整个范围一次性读进内存；空洞（purged/missing）被顺序穿过但不投递；
+- 幂等：投递成功后才持久化进度；下游失败或进程崩溃会重复尝试同一条，
+  目标下游必须按 `(source, seq)` 幂等（与实时投递同一契约），
+  因此**重试与重启续传都不产生重复可见事件**；
+- 目标下游是**独立配置**（`Config.ReplaySinks` / `RegisterReplaySink`），
+  与实时 `Sinks` 物理隔离，路由名互不影响。
+
+### 5A.3 独立且防回退的持久化进度
+
+```
+<dir>/replay/anchors.json            全部回放任务的最新版本锚点（带 MAC）
+<dir>/replay/<hex(jobID)>.job        单任务进度（带链 MAC）
+```
+
+- 与实时 `<dir>/checkpoints/` **物理隔离、域前缀独立**：
+  回放有自己的水位（`next_seq`），不读写实时检查点；
+  **回放进度推进不会回带实时水位，实时投递也不影响回放位置**；
+- 进度每确认一条就原子落盘（先写状态、再提交锚点），字段包括
+  `next_seq / delivered / retries / status / version`；
+- 与实时检查点同样的哈希链 + 锚点规则：版本严格 +1、`PrevMAC` 必须接上当前锚点；
+  崩溃在“状态已写、锚点未提”窗口可自动补提；**旧副本换回 / 版本倒退 / MAC 被改
+  一律 `replay.ErrRollback`，拒绝继续，绝不静默从头重来一遍**；
+- 进度可随时查询：`ReplayProgress(jobID)` / `AllReplays()` 给出当前位置、
+  已投数、剩余数（`matched - delivered`）、失败重试次数与状态
+  （`running/blocked/complete`）。
+
+### 5A.4 与保留清理、合规冻结的关系
+
+- **保留占位（replay hold）**：任务启动即在存储层登记 `[eff_from,eff_to]` 占位。
+  `Purge` 删除分段前除冻结检查外，还会检查回放占位，相交的已封存到期分段
+  **跳过并计入 `PurgeResult.SkippedReplay`**；活动分段本就永不清理；
+- 占位在**发起判定之前**就先按请求最大可能区间登记，判定完成后收窄，
+  因此不存在“先判定、后被清掉”的窗口；回放**完成后释放**占位，清理随即恢复；
+- 存储的写锁与 `Scan` 的不可变快照保证回放不会读到清到一半的分段，
+  也不会读到 `deleted` 之后的内容；
+- 冻结与回放上互不干扰：被冻结的数据对回放正常可见；冻结阻止的是清理，
+  回放占位同样阻止清理，两者叠加时清理只会更保守；
+- 进程重启后内存占位丢失：`Pipeline.New` → `ResumeAll` 会为每个未完成任务
+  **重新登记占位**；若目标下游尚未配置，任务进入 `blocked`（占位仍登记），
+  `RegisterReplaySink` 后 `ResumeReplay(jobID)` 即可继续。
+
+### 5A.5 故障与重启行为（回放）
+
+| 场景 | 行为 |
+|---|---|
+| 回放下游故障 | 当前条保持为 `next_seq`，指数退避重试，`retries` 累加；不越过、不丢 |
+| 进程重启（中途） | 重新校验进度链 → 重新登记保留占位 → 从持久化 `next_seq` 续跑 |
+| 重启时下游未配置 | 任务 `blocked`，注册下游后 `ResumeReplay`；已完成任务不重放 |
+| 进度文件倒退/换旧副本/篡改 | `replay.ErrRollback`，拒绝打开 |
+| 请求范围含已清理空洞 | `Plan.Gaps` 显式标注 `purged` 及依据，其余正常投递 |
+| 请求范围无任何留存 | `Plan.Matched=0` 并给出说明，任务正常完成 |
+| 大批量回放 | 流式扫描 + 逐条投递，内存常驻与范围大小无关 |
+
 ## 6. 日志可解释性
 
 管道使用 `log/slog` 结构化日志，关键节点均输出，单测中以 `t.Logf` 打印核心状态：
@@ -140,8 +234,10 @@ event.ParseEvent ──► Ingest(每来源串行)
 - `delivered`：source/seq/event_id/新检查点水位；
 - `delivery failed`：失败原因与“事件保持 durable pending”的说明；
 - `checkpoint advance rejected`：回退被拒绝的明确记录；
-- `purge complete / FROZEN purge`：清理段数、字节数、冻结跳过数；
-- `recovery: source loaded`：重启后已知事件数、水位、待恢复数。
+- `purge complete / FROZEN purge`：清理段数、字节数、冻结跳过数、回放占位跳过数；
+- `recovery: source loaded`：重启后已知事件数、水位、待恢复数；
+- `replay started / complete`、`replay delivery failed`：回放范围判定
+  （eff 区间、matched/gaps/skipped）、当前位置、重试与完成状态。
 
 ## 7. 本地验证
 
@@ -153,29 +249,50 @@ go test ./... -race -count=1
 
 # 只跑关键场景
 go test ./pkg/pipeline/ -run 'TestDuplicate|TestDownstream|TestRestart|TestConcurrent|TestFreeze' -v
-go test ./pkg/storage/ -v   # 追加/清理/冻结/篡改检测
+go test ./pkg/pipeline/ -run 'TestReplay' -v   # 回放：顺序/边界/续传/清理并发/故障重试
+go test ./pkg/replay/ -v                       # 回放进度链、回退拒绝、中途崩溃续传
+go test ./pkg/storage/ -v   # 追加/清理/冻结/回放占位/篡改检测
 go test ./pkg/checkpoint/ -v # 水位单调/回退拒绝/换复件/锚点篡改
 
-# 端到端演示：重复/非法/拒绝 + 下游故障 + 冻结清理 + 指标
+# 端到端演示：重复/非法/拒绝 + 下游故障 + 冻结清理 + 历史回放 + 指标
 go run ./cmd/auditd -dir ./data/demo
-# 再次运行可观察“重启恢复”：已确认事件不重放，pending 事件继续投递
+# 再次运行可观察“重启恢复”：已完成回放不重放（ErrExists），pending 事件继续投递
 ```
 
 测试覆盖的关键场景：
 
 - `TestDuplicateAndRejectAndOrder`：重复投递（同 ID / 同 seq）、拒绝、非法输入、顺序；
 - `TestDownstreamFailureNoLossNoDuplicate`：下游故障期间有界、水位不动、恢复后不丢不重；
-- `TestRestartResumesPending` / `TestRestartAfterPartialDelivery`：重启续传；
+- `TestRestartResumesPending` / `TestRestartAfterPartialDelivery`：实时投递重启续传；
 - `TestConcurrentWriteAndPurge`（`-race`）：多来源并发写 + 并发读 + 并发清理；
 - `TestFreezeDuringPurge`：冻结期间跳过、解除后清理；
 - `TestTamperDetectedOnModify` / `TestTamperDetectedOnOrphanSegment`：
   帧改写、孤立分段；
-- `TestRestoreOldCopyRejected` / `TestAnchorTamperRejected`：检查点回退与篡改拒绝。
+- `TestRestoreOldCopyRejected` / `TestAnchorTamperRejected`：检查点回退与篡改拒绝；
+- `TestOrderAndSeqBounds` / `TestTimeRange`：回放序号/时间闭区间边界、
+  部分命中分段的逐条跳过解释、接入时 rejected 不回放；
+- `TestDownstreamFailureRetriesNoDuplicate`：回放下游故障重试不重复可见；
+- `TestMidwayCrashResumeFromDurableProgress`：中途崩溃后按持久化 `next_seq` 续跑；
+- `TestProgressPersistsAcrossRestart`：已完成回放重启不重放；
+- `TestRollbackRejected`：回放进度篡改/旧副本被拒绝；
+- `TestReplayEndToEndRangeAndIndependence`：真实存储上的范围命中、
+  独立回放下游、实时水位不受回放影响；
+- `TestReplayHoldBlocksPurge`：回放进行中清理跳过占位段，完成后恢复清理；
+- `TestReplayConcurrentWithIngestPurgeFreeze`（`-race`）：
+  大批量回放与并发接入/清理/冻结互不破坏、顺序不变；
+- `TestReplayRetriesNoDuplicateVisible`：回放故障窗口后无重复可见。
 
 ## 8. 设计边界（明确取舍）
 
 - 下游为内存模拟，演示“投递侧幂等”契约；接入真实下游时，应由下游提供
-  基于 `(source, seq)` 的幂等，或在适配器层维护去重表。
+  基于 `(source, seq)` 的幂等，或在适配器层维护去重表。**回放目标下游适用
+  完全相同的幂等契约**，否则故障重试可能产生重复可见。
+- 回放范围判定是**发起时快照**：进行中新增且落在范围内的事件不纳入本次任务，
+  需要它们请另开任务；回放默认不投递接入时被 `rejected` 的事件（留存不变）。
+- 时间范围过滤按事件 `timestamp` 判定；分段剪枝只使用落盘时间 `StoredAt` 做
+  保守排除，存疑的分段一律保留到逐条判定，避免误剪。
+- 回放占位只在任务生命周期内阻止清理；若事件在**发起回放之前**就已被清理，
+  不会报错中止，而是在 `Plan.Gaps` 中以 `purged` 显式列出，其余照常回放。
 - 帧链按“每分段独立起链”设计，分段连续性由清单链与每段序号区间共同约束；
 - 合法清理保留 `deleted` 墓碑条目，因此“清单”本身不被清理，长期运行时
   可通过压缩已删除墓碑（同样需要重算链）扩展，本实现未包含该压缩器。

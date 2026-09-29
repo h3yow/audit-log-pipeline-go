@@ -35,10 +35,12 @@ func main() {
 		{Name: "billing-route", Sources: []string{"billing"}, Action: router.ActionAccept, Route: "audit"},
 	}, "audit")
 	ms := sink.NewMemorySink()
+	replayMs := sink.NewMemorySink()
 	p, err := pipeline.New(pipeline.Config{
 		Dir:           *dir,
 		Router:        r,
 		Sinks:         map[string]sink.Sink{"audit": ms},
+		ReplaySinks:   map[string]sink.Sink{"replay-audit": replayMs},
 		Retention:     storage.Retention{MaxAge: 24 * time.Hour},
 		PurgeInterval: 10 * time.Second,
 		MaxInFlight:   128,
@@ -107,7 +109,39 @@ func main() {
 	})
 	res, _ := p.PurgeNow(time.Now())
 	logger.Info("purge with active freeze",
-		"deleted", res.DeletedSegments, "skipped_frozen", res.SkippedFrozen)
+		"deleted", res.DeletedSegments, "skipped_frozen", res.SkippedFrozen,
+		"skipped_replay", res.SkippedReplay)
+
+	// 4. 历史回放演示：把 web 来源 seq 1..3 的留存事件按原始顺序
+	//    重新投递到独立下游 replay-audit（实时水位不受影响）。
+	logger.Info("=== starting historical replay web seq[1,3] -> replay-audit ===")
+	prog, err := p.StartReplay(ctx, "demo-replay-1", "web", "replay-audit",
+		pipeline.ReplayRange{FromSeq: 1, ToSeq: 3})
+	if err != nil {
+		// 同一 JobID 重复发起是显式错误（幂等任务键）：已完成的不重放，
+		// 未完成的重启后会被 ResumeAll 自动续跑。
+		logger.Info("replay start skipped (job already exists; completed jobs are never replayed)",
+			"err", err)
+		if existing, gerr := p.ReplayProgress("demo-replay-1"); gerr == nil {
+			logger.Info("existing replay", "status", existing.Status,
+				"delivered", existing.Delivered, "next_seq", existing.NextSeq)
+		}
+	} else {
+		logger.Info("replay plan",
+			"job", prog.JobID, "eff_seq", [2]int64{prog.Plan.EffFromSeq, prog.Plan.EffToSeq},
+			"matched", prog.Plan.Matched, "gaps", len(prog.Plan.Gaps),
+			"skipped", len(prog.Plan.Skipped), "note", prog.Plan.Note)
+		final, werr := p.WaitReplay(ctx, prog.JobID)
+		if werr != nil {
+			logger.Error("replay wait failed", "err", werr)
+		} else {
+			logger.Info("replay complete",
+				"job", final.JobID, "status", final.Status,
+				"delivered", final.Delivered, "remaining", final.Remaining(),
+				"retries", final.Retries)
+			logger.Info("replay target visible", "ids", replayMs.Visible("replay-audit", "web"))
+		}
+	}
 
 	// 优雅关闭
 	sig := make(chan os.Signal, 1)

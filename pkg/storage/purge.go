@@ -44,6 +44,10 @@ func (s *Store) Purge(nowUnix int64) (PurgeResult, error) {
 				res.SkippedFrozen++
 				continue
 			}
+			if overlapsReplayHold(s.replayHolds, source, e.MinSeq, e.MaxSeq) {
+				res.SkippedReplay++
+				continue
+			}
 			size := e.Size
 			path := filepath.Join(st.dir, e.Name)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
