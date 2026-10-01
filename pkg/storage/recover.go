@@ -72,6 +72,14 @@ func (s *Store) verifySource(st *srcState, now interface{}) error {
 		if r.minSeq != e.MinSeq || r.maxSeq != e.MaxSeq || r.records != e.Records {
 			return ErrTampered // 内容被改写
 		}
+		// 事件时间界是回放剪枝依据，同样纳入一致性校验；
+		// 清单中为 0（未知/旧数据）时跳过，回放侧对未知界本就不剪枝。
+		if e.MinEventTS != 0 && r.minEventTS != e.MinEventTS {
+			return ErrTampered
+		}
+		if e.MaxEventTS != 0 && r.maxEventTS != e.MaxEventTS {
+			return ErrTampered
+		}
 		_ = i
 	}
 	// 孤立分段：磁盘有但清单没有（乱序/非法插入）。

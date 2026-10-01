@@ -207,6 +207,8 @@ func (s *Store) repairActive(st *srcState) error {
 	st.active.Records = sr.records
 	st.active.FirstStored = sr.firstStored
 	st.active.LastStored = sr.lastStored
+	st.active.MinEventTS = sr.minEventTS
+	st.active.MaxEventTS = sr.maxEventTS
 	if info.Size() != sr.goodBytes {
 		if err := s.saveManifest(st); err != nil {
 			return err

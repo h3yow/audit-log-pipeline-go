@@ -153,8 +153,16 @@ event.ParseEvent ──► Ingest(每来源串行)
 
 `Pipeline.StartReplay(jobID, source, target, ReplayRange{FromSeq,ToSeq,From,To})`
 
-- 区间全部是**闭区间**；序号与时间可以单独给，也可以组合（同时满足才命中）；
+- 区间全部是**闭区间**（两端时刻本身算命中）；序号与时间可以单独给，
+  也可以组合（同时满足才命中）；
   至少要给一个边界，否则返回 `replay.ErrInvalidRequest`；
+- **时间区间一律按事件自身时间戳（`event.timestamp`）判定命中，与接入
+  落盘时间（`stored_at`）无关**：事件发生得早、但过了一段时间才接进来
+  落盘的“迟到数据”，只要事件时间落在区间内就必须命中；反过来落盘时间
+  落在区间内、事件时间在区间外的记录也不命中。分段级剪枝同样只使用
+  清单中维护的**段内事件时间上下界**（`min_event_ts/max_event_ts`，
+  随追加/封存/恢复维护并纳入清单哈希链），绝不按落盘时间剪枝——
+  段界未知或未封存的分段一律不排除，交给逐条判定（安全方向）；
 - 开始前在清单快照上做一次**静态判定（Plan）**，结果持久化进任务：
   - `eff_from_seq/eff_to_seq`：实际扫描的序号闭区间（依据分段元数据剪枝）；
   - `matched`：通过全部过滤、应当投递的记录总数；
@@ -162,7 +170,15 @@ event.ParseEvent ──► Ingest(每来源串行)
     即被保留期清理）与 `missing`（该序号从未存在于留存），都附判定依据；
   - `skipped`：逐条记录的跳过原因，**没有任何一条被默默跳过**：
     `before_range/after_range`（部分命中的分段）、`outside_time`（在序号范围内
-    但不在时间区间内）、`rejected`（接入时命中拒绝策略，留存但回放也不投递）；
+    但不在时间区间内）、`rejected`（接入时命中拒绝策略，留存但回放也不投递）。
+    逐条说明最多保留 2048 条，超出部分计入 `skipped_total`（大批量回放时
+    进度文件不会无界增长）；
+  - `pruned`：被段级元数据**整体排除**的分段列表，逐段附排除依据
+    （段事件时间界严格落在区间之外）；只有事件时间界已知的已封存段才允许
+    整体排除，且必须在这里显式说明；
+  - 对账恒等式：`matched + skipped_total == 扫描区间记录数`，
+    `扫描区间 + pruned 覆盖 == 请求触及的全部留存`——命中数、跳过说明、
+    缺失范围三者必须互相对得上，不允许“记录没投出去、也没说明、任务却报完成”；
 - 计划是**快照语义**：扫描区间在发起时确定，回放进行中新接入、且落在范围内的
   事件不属于本次任务（进度 `next_seq` 越过计划右端即完成），需要重放可另开任务；
 - 同一 `jobID` 是幂等任务键：重复发起返回 `replay.ErrExists`，绝不重放第二遍。
@@ -202,8 +218,11 @@ event.ParseEvent ──► Ingest(每来源串行)
 - **保留占位（replay hold）**：任务启动即在存储层登记 `[eff_from,eff_to]` 占位。
   `Purge` 删除分段前除冻结检查外，还会检查回放占位，相交的已封存到期分段
   **跳过并计入 `PurgeResult.SkippedReplay`**；活动分段本就永不清理；
-- 占位在**发起判定之前**就先按请求最大可能区间登记，判定完成后收窄，
-  因此不存在“先判定、后被清掉”的窗口；回放**完成后释放**占位，清理随即恢复；
+- 占位在**发起判定之前**就先按请求最大可能区间登记，判定完成后收窄到实际
+  扫描区间，因此不存在“先判定、后被清掉”的窗口；回放**完成后释放**占位，
+  清理随即恢复。被 `pruned` 显式排除的分段（事件时间界严格在区间之外，
+  不可能命中）不在收窄后的占位内，可被正常清理——它们不属于本次回放，
+  清理它们不影响命中结果，且排除事实已持久化在计划里；
 - 存储的写锁与 `Scan` 的不可变快照保证回放不会读到清到一半的分段，
   也不会读到 `deleted` 之后的内容；
 - 冻结与回放上互不干扰：被冻结的数据对回放正常可见；冻结阻止的是清理，
@@ -222,7 +241,8 @@ event.ParseEvent ──► Ingest(每来源串行)
 | 进度文件倒退/换旧副本/篡改 | `replay.ErrRollback`，拒绝打开 |
 | 请求范围含已清理空洞 | `Plan.Gaps` 显式标注 `purged` 及依据，其余正常投递 |
 | 请求范围无任何留存 | `Plan.Matched=0` 并给出说明，任务正常完成 |
-| 大批量回放 | 流式扫描 + 逐条投递，内存常驻与范围大小无关 |
+| 区间整个落在迟到批次之前/之后 | 命中为 0 是合法结果；被排除的分段在 `Plan.Pruned` 逐段说明 |
+| 大批量回放 | 流式扫描 + 逐条投递，内存常驻与范围大小无关；逐条跳过说明超上限后只计数（`skipped_total`） |
 
 ## 6. 日志可解释性
 
@@ -251,6 +271,9 @@ go test ./... -race -count=1
 go test ./pkg/pipeline/ -run 'TestDuplicate|TestDownstream|TestRestart|TestConcurrent|TestFreeze' -v
 go test ./pkg/pipeline/ -run 'TestReplay' -v   # 回放：顺序/边界/续传/清理并发/故障重试
 go test ./pkg/replay/ -v                       # 回放进度链、回退拒绝、中途崩溃续传
+go test ./pkg/replay/ -run 'TestTimeRange|TestSegmentCouldMatch' -v
+#   ↑ 时间区间回放专项：迟到数据（事件时间早、落盘晚）大留存命中、
+#     闭区间端点、部分命中段对账、零命中显式说明、重启续传、清理/冻结并发
 go test ./pkg/storage/ -v   # 追加/清理/冻结/回放占位/篡改检测
 go test ./pkg/checkpoint/ -v # 水位单调/回退拒绝/换复件/锚点篡改
 
@@ -281,6 +304,18 @@ go run ./cmd/auditd -dir ./data/demo
 - `TestReplayConcurrentWithIngestPurgeFreeze`（`-race`）：
   大批量回放与并发接入/清理/冻结互不破坏、顺序不变；
 - `TestReplayRetriesNoDuplicateVisible`：回放故障窗口后无重复可见。
+- `TestTimeRangeLateIngestLargeRetention`：迟到数据（事件时间落在区间内、
+  落盘时间晚于区间上界）跨近百个已封存分段，时间区间回放必须全部命中、
+  按序投出，且命中/逐条跳过/段级排除三者对账覆盖全部留存；
+- `TestTimeRangeInclusiveBounds` / `TestTimeRangePartialSegmentAccounting` /
+  `TestTimeRangeEntirelyBeforeLateBatch`：闭区间端点算命中、部分命中段
+  逐条说明、零命中时每个被排除分段都有 `pruned` 说明；
+- `TestTimeRangeResumeAfterRestart`：时间区间回放中途重启，续跑部分
+  不按落盘时间被跳过，不重不漏；
+- `TestTimeRangeConcurrentPurgeFreeze`（`-race`）：时间区间回放进行中
+  并发清理/冻结，占位保护范围内分段，回放完整投出；
+- `TestSegmentCouldMatchByEventTime`：锁定剪枝语义——只按事件时间界排除，
+  落盘时间对不上不得排除，界未知/未封存一律保留。
 
 ## 8. 设计边界（明确取舍）
 
@@ -289,8 +324,10 @@ go run ./cmd/auditd -dir ./data/demo
   完全相同的幂等契约**，否则故障重试可能产生重复可见。
 - 回放范围判定是**发起时快照**：进行中新增且落在范围内的事件不纳入本次任务，
   需要它们请另开任务；回放默认不投递接入时被 `rejected` 的事件（留存不变）。
-- 时间范围过滤按事件 `timestamp` 判定；分段剪枝只使用落盘时间 `StoredAt` 做
-  保守排除，存疑的分段一律保留到逐条判定，避免误剪。
+- 时间范围过滤按事件 `timestamp` 判定；分段剪枝只使用清单维护的
+  **段内事件时间上下界**（`min_event_ts/max_event_ts`）做保守排除，
+  绝不使用落盘时间 `StoredAt`（迟到数据落盘晚于区间上界也必须命中）；
+  界未知或未封存的分段一律保留到逐条判定，避免误剪。
 - 回放占位只在任务生命周期内阻止清理；若事件在**发起回放之前**就已被清理，
   不会报错中止，而是在 `Plan.Gaps` 中以 `purged` 显式列出，其余照常回放。
 - 帧链按“每分段独立起链”设计，分段连续性由清单链与每段序号区间共同约束；

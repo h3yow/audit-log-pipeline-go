@@ -8,6 +8,8 @@ type SegmentMeta struct {
 	Records     int
 	FirstStored int64 // 段内首条记录 StoredAt（unix 秒）
 	LastStored  int64 // 段内末条记录 StoredAt（unix 秒）
+	MinEventTS  int64 // 段内事件自身时间戳最小值（unix 纳秒）；0=未知（不用于剪枝）
+	MaxEventTS  int64 // 段内事件自身时间戳最大值（unix 纳秒）；0=未知（不用于剪枝）
 	Sealed      bool
 	Deleted     bool
 }
@@ -67,6 +69,8 @@ func (s *Store) ReplaySnapshot(source string) (ReplaySnapshot, error) {
 			Records:     e.Records,
 			FirstStored: e.FirstStored,
 			LastStored:  e.LastStored,
+			MinEventTS:  e.MinEventTS,
+			MaxEventTS:  e.MaxEventTS,
 			Sealed:      e.Sealed,
 			Deleted:     e.Deleted,
 		})

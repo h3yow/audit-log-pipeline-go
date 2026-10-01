@@ -43,7 +43,9 @@ func seedFake(t *testing.T, f *fakeStore, src string, n int64, rejected ...int64
 
 func waitStatus(t *testing.T, m *Manager, id string, want Status) Progress {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// 大批量回放在 -race 下单条持久化较慢，deadline 需要足够宽；
+	// 小数据用例会立即命中目标状态，不受长 deadline 影响。
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		p, err := m.Get(id)
 		if err != nil {

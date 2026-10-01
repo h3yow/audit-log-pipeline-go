@@ -71,6 +71,17 @@ type Gap struct {
 	Reason  string `json:"reason"` // 判定依据（清单项 deleted / 从未存在）
 }
 
+// PrunedSegment 是一个在计划阶段被段级元数据整体排除的分段。
+// 只有段的事件时间界（而非落盘时间）严格落在请求区间之外时才允许排除；
+// 被排除的段必须在这里显式说明，绝不静默忽略。
+type PrunedSegment struct {
+	Name   string   `json:"name"`
+	MinSeq int64    `json:"min_seq"`
+	MaxSeq int64    `json:"max_seq"`
+	Kind   SkipKind `json:"kind"`
+	Reason string   `json:"reason"`
+}
+
 // Plan 是回放开始前对范围的静态判定结果（快照语义）。
 type Plan struct {
 	Source     string    `json:"source"`
@@ -79,9 +90,12 @@ type Plan struct {
 	EffToSeq   int64     `json:"job_to_seq"`
 	Matched    int64     `json:"matched"` // 通过全部过滤、应当投递的记录数
 	Gaps       []Gap     `json:"gaps"`
-	Skipped    []Skipped `json:"skipped"`
-	Note       string    `json:"note"`
-	CreatedAt  time.Time `json:"created_at"`
+	Skipped    []Skipped `json:"skipped"` // 逐条跳过说明（数量有上限，见 SkippedTotal）
+	// SkippedTotal 是被跳过记录的总数；超出 Skipped 切片上限的部分只计数。
+	SkippedTotal int64           `json:"skipped_total"`
+	Pruned       []PrunedSegment `json:"pruned,omitempty"` // 段级整体排除说明
+	Note         string          `json:"note"`
+	CreatedAt    time.Time       `json:"created_at"`
 }
 
 // Progress 是一个回放任务持久化的全部状态。

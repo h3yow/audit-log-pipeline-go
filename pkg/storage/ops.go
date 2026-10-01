@@ -71,6 +71,15 @@ func (s *Store) Append(rec Record) error {
 		st.active.MinSeq = e.Seq
 		st.active.FirstStored = now
 	}
+	// 事件自身时间界（unix 纳秒）：供回放按事件时间做段级剪枝。
+	// 与落盘时间无关——迟到数据落盘晚但事件时间早，必须仍能被时间区间命中。
+	ts := e.Timestamp.UnixNano()
+	if entryFirst || st.active.MinEventTS == 0 || ts < st.active.MinEventTS {
+		st.active.MinEventTS = ts
+	}
+	if ts > st.active.MaxEventTS {
+		st.active.MaxEventTS = ts
+	}
 	st.active.MaxSeq = e.Seq
 	st.active.LastStored = now
 	st.active.Records++

@@ -18,6 +18,8 @@ type segEntry struct {
 	Size        int64  `json:"size"`
 	FirstStored int64  `json:"first_stored"`
 	LastStored  int64  `json:"last_stored"`
+	MinEventTS  int64  `json:"min_event_ts,omitempty"` // 段内事件自身时间戳最小值（unix 纳秒）；0=未知
+	MaxEventTS  int64  `json:"max_event_ts,omitempty"` // 段内事件自身时间戳最大值（unix 纳秒）；0=未知
 	Sealed      bool   `json:"sealed"`
 	Deleted     bool   `json:"deleted"` // 合法清理：文件已删除，条目留在链上可审计
 	TailMAC     string `json:"tail_mac,omitempty"`
@@ -37,6 +39,8 @@ type entryHashInput struct {
 	Size        int64
 	FirstStored int64
 	LastStored  int64
+	MinEventTS  int64
+	MaxEventTS  int64
 	Sealed      bool
 	Deleted     bool
 	TailMAC     string
@@ -46,7 +50,8 @@ func entryHash(key, prev []byte, e *segEntry) string {
 	in := entryHashInput{
 		Name: e.Name, MinSeq: e.MinSeq, MaxSeq: e.MaxSeq,
 		Records: e.Records, Size: e.Size, FirstStored: e.FirstStored,
-		LastStored: e.LastStored, Sealed: e.Sealed, Deleted: e.Deleted,
+		LastStored: e.LastStored, MinEventTS: e.MinEventTS, MaxEventTS: e.MaxEventTS,
+		Sealed: e.Sealed, Deleted: e.Deleted,
 		TailMAC: e.TailMAC,
 	}
 	body, _ := json.Marshal(in)
