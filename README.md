@@ -155,14 +155,24 @@ event.ParseEvent ──► Ingest(每来源串行)
 
 - 区间全部是**闭区间**；序号与时间可以单独给，也可以组合（同时满足才命中）；
   至少要给一个边界，否则返回 `replay.ErrInvalidRequest`；
+- **时间命中按事件自身时间戳 `event.timestamp` 判定，与落盘时间 `StoredAt` 无关。**
+  这一点对“很早发生、过了很久才接入落盘”的历史批次至关重要：它们的
+  `StoredAt` 整体晚于回放时间上界，但只要事件时间落在区间内就必须命中。
+  因此清单层面的**段级剪枝只使用序号区间**（`MinSeq/MaxSeq` 不相交才排除），
+  **绝不使用 `StoredAt` 推断事件时间**；凡时间条件一律落到逐条判定
+  （`from <= event.timestamp <= to`，两端时刻本身命中）。这样大批量历史
+  数据（多个已封存段、落盘时间很晚）也不会被整段默默剪掉；
 - 开始前在清单快照上做一次**静态判定（Plan）**，结果持久化进任务：
-  - `eff_from_seq/eff_to_seq`：实际扫描的序号闭区间（依据分段元数据剪枝）；
+  - `eff_from_seq/eff_to_seq`：实际扫描的序号闭区间（仅依据分段序号区间剪枝）；
   - `matched`：通过全部过滤、应当投递的记录总数；
-  - `gaps`：请求区间内的缺失序号段，区分为 `purged`（命中 `deleted` 清单项，
-    即被保留期清理）与 `missing`（该序号从未存在于留存），都附判定依据；
+  - `gaps`：请求序号覆盖范围内的缺失序号段，区分为 `purged`（命中 `deleted`
+    清单项，即被保留期清理）与 `missing`（该序号从未存在于留存），都附判定依据；
   - `skipped`：逐条记录的跳过原因，**没有任何一条被默默跳过**：
     `before_range/after_range`（部分命中的分段）、`outside_time`（在序号范围内
-    但不在时间区间内）、`rejected`（接入时命中拒绝策略，留存但回放也不投递）；
+    但不在时间区间内，含“区间整体早/晚于本批事件”的情形）、
+    `rejected`（接入时命中拒绝策略，留存但回放也不投递）；
+  - 对纯时间区间回放，`matched + len(skipped)` 等于扫描范围内的留存记录总数，
+    缺失序号另在 `gaps` 中列出——三者可交叉对账，不会出现“没投出去也没解释”；
 - 计划是**快照语义**：扫描区间在发起时确定，回放进行中新接入、且落在范围内的
   事件不属于本次任务（进度 `next_seq` 越过计划右端即完成），需要重放可另开任务；
 - 同一 `jobID` 是幂等任务键：重复发起返回 `replay.ErrExists`，绝不重放第二遍。
@@ -254,10 +264,52 @@ go test ./pkg/replay/ -v                       # 回放进度链、回退拒绝�
 go test ./pkg/storage/ -v   # 追加/清理/冻结/回放占位/篡改检测
 go test ./pkg/checkpoint/ -v # 水位单调/回退拒绝/换复件/锚点篡改
 
-# 端到端演示：重复/非法/拒绝 + 下游故障 + 冻结清理 + 历史回放 + 指标
+# 时间区间回放专项（按事件时间命中、晚落盘历史批次、边界/跨留存/重启/并发）
+go test ./pkg/pipeline/ -run 'TestReplayTimeRange' -v
+go test ./pkg/replay/ -run 'TestSegmentCouldMatchIgnoresStoredAt|TestPlanLateStoredBatchReconciles' -v
+
+# 端到端演示：重复/非法/拒绝 + 下游故障 + 冻结清理 + 序号回放
+#   + 晚落盘历史批次的时间区间回放（hist-4..hist-8 命中）+ 指标
 go run ./cmd/auditd -dir ./data/demo
 # 再次运行可观察“重启恢复”：已完成回放不重放（ErrExists），pending 事件继续投递
 ```
+
+### 7.1 本地复现“时间区间回放命中晚落盘历史数据”
+
+问题场景：事件自身时间很早，但成批很晚才接入落盘（`StoredAt` 晚于回放区间
+上界）。修复前会因按落盘时间剪枝而 `matched=0`、投递 0 条却报完成；修复后
+按事件自身时间命中。最小复现路径：
+
+1. 接入一批事件，`timestamp` 设为历史时刻（如 `2026-01-01T00:00:0xZ`），
+   在“现在”调用 `Ingest`（落盘时间即当下）；调小分段阈值
+   （`store.SetMaxSegmentBytesForTest`）并 `SealActiveSegment`，
+   让数据分布在多个**已封存**段上（模拟几百 MB 历史留存）。
+2. 发起纯时间区间回放：`StartReplay(job, source, target,
+   ReplayRange{From: t1, To: t2})`，`[t1,t2]` 落在历史事件时间内、
+   但整体早于当下的落盘时间。
+3. 断言：`Plan.Matched` 与区间内事件数一致；目标下游按 seq 升序收到且仅收到
+   这些事件；`Plan.Skipped` 对其余记录逐条给出 `outside_time`；
+   `Delivered == Matched`、`Remaining()==0`、状态 `complete`。
+4. 变体：`-race` 下并发 `Purge/AddFreeze/Ingest`（回放占位使清理跳过相关段，
+   不读到已删内容）；投递确认一部分后关闭重开，从持久化 `next_seq` 续跑，
+   最终集合/顺序不变。
+
+对应自动化用例：
+
+- `TestReplayTimeRangeLateStoredBatch`：600 条晚落盘历史事件跨多个已封存段，
+  时间闭区间命中 101 条，断言投递集合、顺序、`matched+skipped==600`；
+- `TestReplayTimeRangeBoundariesInclusive`：两端时刻本身命中、部分命中逐条说明、
+  单侧 `From` 边界；
+- `TestReplayTimeRangeSpansRetainedHistory`：区间跨越一个被保留期清理的中段，
+  命中投递 + `gaps.purged` 显式缺失，数量可交叉对账；
+- `TestReplayTimeRangeLateStoredResumeAfterRestart` /
+  `TestReplayTimeRangeLateStoredMidwayCrash`：重启 / 中途崩溃后按
+  `next_seq` 续跑，剩余部分不漏不重；
+- `TestReplayTimeRangeLateStoredConcurrentPurgeFreeze`（`-race`）：
+  大批量时间回放与清理/冻结并发，占位保护、顺序与集合正确；
+- `TestSegmentCouldMatchIgnoresStoredAt` /
+  `TestPlanLateStoredBatchReconciles`（`pkg/replay`）：段级剪枝只看序号、
+  Plan 对账与“区间整体早于本批事件”时的逐条 `outside_time` 说明。
 
 测试覆盖的关键场景：
 
@@ -280,6 +332,16 @@ go run ./cmd/auditd -dir ./data/demo
 - `TestReplayHoldBlocksPurge`：回放进行中清理跳过占位段，完成后恢复清理；
 - `TestReplayConcurrentWithIngestPurgeFreeze`（`-race`）：
   大批量回放与并发接入/清理/冻结互不破坏、顺序不变；
+- `TestReplayTimeRangeLateStoredBatch`：**晚落盘历史批次的时间区间回放**
+  （多已封存段、事件时间在区间内而 StoredAt 晚上界），命中集合/顺序/对账；
+- `TestReplayTimeRangeBoundariesInclusive`：时间闭区间两端时刻本身命中、
+  一段数据部分命中逐条 `outside_time`、单侧边界；
+- `TestReplayTimeRangeSpansRetainedHistory`：区间跨越被清理段，
+  命中投递 + `gaps.purged` 显式缺失，数量互相对账；
+- `TestReplayTimeRangeLateStoredResumeAfterRestart` /
+  `TestReplayTimeRangeLateStoredMidwayCrash`：时间回放重启 / 中途崩溃后续跑；
+- `TestReplayTimeRangeLateStoredConcurrentPurgeFreeze`（`-race`）：
+  晚落盘批次时间回放与清理/冻结并发，不漏投、不读已删、顺序不变；
 - `TestReplayRetriesNoDuplicateVisible`：回放故障窗口后无重复可见。
 
 ## 8. 设计边界（明确取舍）
@@ -289,8 +351,9 @@ go run ./cmd/auditd -dir ./data/demo
   完全相同的幂等契约**，否则故障重试可能产生重复可见。
 - 回放范围判定是**发起时快照**：进行中新增且落在范围内的事件不纳入本次任务，
   需要它们请另开任务；回放默认不投递接入时被 `rejected` 的事件（留存不变）。
-- 时间范围过滤按事件 `timestamp` 判定；分段剪枝只使用落盘时间 `StoredAt` 做
-  保守排除，存疑的分段一律保留到逐条判定，避免误剪。
+- 时间范围过滤**只按事件 `timestamp` 判定**（闭区间，两端时刻本身命中）；
+  段级剪枝**只按序号区间**，不使用落盘时间 `StoredAt`——历史事件可能很晚才
+  接入，`StoredAt` 与事件时间不同源，用它剪枝会把本该命中的整段默默丢掉。
 - 回放占位只在任务生命周期内阻止清理；若事件在**发起回放之前**就已被清理，
   不会报错中止，而是在 `Plan.Gaps` 中以 `purged` 显式列出，其余照常回放。
 - 帧链按“每分段独立起链”设计，分段连续性由清单链与每段序号区间共同约束；

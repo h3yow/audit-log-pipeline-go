@@ -42,8 +42,8 @@ func (m *Manager) buildPlan(req StartRequest) (Plan, error) {
 		return Plan{}, err
 	}
 
-	// 1) 用段元数据推导实际扫描的序号闭区间 [effFrom, effTo]，
-	//    并依据 StoredAt（unix 秒）剪枝明显不可能命中时间条件的已封存段。
+	// 1) 用段序号元数据推导实际扫描的序号闭区间 [effFrom, effTo]。
+	//    不按落盘时间 StoredAt 剪枝（事件可能晚接入），时间命中交给逐条判定。
 	effFrom, effTo := int64(0), int64(0)
 	for _, seg := range snap.Segments {
 		if seg.Deleted || seg.Records == 0 || seg.MaxSeq == 0 {
@@ -147,27 +147,18 @@ func emptyReason(s, fallback string) string {
 }
 
 // segmentCouldMatch 依据段元数据判断该段是否可能命中请求。
+//
+// 只用**序号**元数据剪枝：时间命中一律以事件自身 timestamp 逐条判定，
+// 绝不使用落盘时间 StoredAt 做段级剪枝。原因是 StoredAt 与事件时间
+// 并不同源——一批很早发生的历史事件可能很晚才接入落盘（其 StoredAt
+// 整体晚于回放时间上界），用 StoredAt 推事件时间会把本该命中的整段
+// 默默剪掉（表现为 matched=0、投递 0 条、任务却报完成）。
 func segmentCouldMatch(seg storage.SegmentMeta, rng Range) bool {
 	if rng.FromSeq > 0 && seg.MaxSeq < rng.FromSeq {
 		return false
 	}
 	if rng.ToSeq > 0 && seg.MinSeq > rng.ToSeq {
 		return false
-	}
-	// 段 StoredAt 是落盘时间（秒），事件时间与之不同源，仅作粗剪枝：
-	// 段完全早于时间下界（含 1 秒粒度余量）时才排除；存疑保留，交给逐条判定。
-	if rng.From != nil {
-		fromU := rng.From.Unix()
-		if seg.LastStored > 0 && seg.LastStored < fromU-1 && seg.Sealed {
-			// 最后一条落盘都早于下界：段内事件时间不可能晚于它（落盘不早于事件产生）。
-			return false
-		}
-	}
-	if rng.To != nil {
-		toU := rng.To.Unix()
-		if seg.FirstStored > 0 && seg.FirstStored > toU+1 && seg.Sealed {
-			return false
-		}
 	}
 	return true
 }

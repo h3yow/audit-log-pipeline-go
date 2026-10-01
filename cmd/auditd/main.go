@@ -143,6 +143,47 @@ func main() {
 		}
 	}
 
+	// 5. 时间区间回放复现：一批“很早发生、现在才接入”的历史事件。
+	//    事件时间戳是 2026-01-01，落盘时间是当下（StoredAt 晚于回放区间上界）。
+	//    时间回放必须按事件自身时间戳命中，而不是按落盘时间剪枝。
+	logger.Info("=== ingesting a late-arriving historical batch (event ts=2026-01-01, stored now) ===")
+	histBase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := int64(1); i <= 12; i++ {
+		ingest(&event.Event{
+			ID: fmt.Sprintf("hist-%d", i), Source: "history", Seq: i, Type: "login",
+			Subject: "bob", Action: "signin", Resource: "archive",
+			Timestamp: histBase.Add(time.Duration(i) * time.Second),
+		})
+	}
+	time.Sleep(300 * time.Millisecond)
+	hFrom := histBase.Add(4 * time.Second)
+	hTo := histBase.Add(8 * time.Second)
+	logger.Info("=== starting TIME-range replay history [00:00:04,00:00:08] (by event timestamp) ===")
+	hprog, err := p.StartReplay(ctx, "demo-replay-time-1", "history", "replay-audit",
+		pipeline.ReplayRange{From: &hFrom, To: &hTo})
+	if err != nil {
+		logger.Info("time replay start skipped (job already exists)", "err", err)
+		if existing, gerr := p.ReplayProgress("demo-replay-time-1"); gerr == nil {
+			logger.Info("existing time replay", "status", existing.Status,
+				"delivered", existing.Delivered, "next_seq", existing.NextSeq)
+		}
+	} else {
+		logger.Info("time replay plan",
+			"job", hprog.JobID, "eff_seq", [2]int64{hprog.Plan.EffFromSeq, hprog.Plan.EffToSeq},
+			"matched", hprog.Plan.Matched, "gaps", len(hprog.Plan.Gaps),
+			"skipped", len(hprog.Plan.Skipped), "note", hprog.Plan.Note)
+		hfin, werr := p.WaitReplay(ctx, hprog.JobID)
+		if werr != nil {
+			logger.Error("time replay wait failed", "err", werr)
+		} else {
+			logger.Info("time replay complete",
+				"job", hfin.JobID, "status", hfin.Status,
+				"delivered", hfin.Delivered, "remaining", hfin.Remaining())
+			logger.Info("time replay target visible (expect hist-4..hist-8)",
+				"ids", replayMs.Visible("replay-audit", "history"))
+		}
+	}
+
 	// 优雅关闭
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
